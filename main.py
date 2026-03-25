@@ -1,110 +1,91 @@
-import logging
+import os
 from fastapi import FastAPI
 import inngest
 import inngest.fast_api
-from inngest.experimental import ai
 from dotenv import load_dotenv
-import uuid
-import os
-import datetime
 
-# Local modules
-from data_loader import load_and_chunk_pdf, embed_texts
-from vector_db import QdrantStorage
-from custom_types import RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
+# Query specific imports
+from llama_index.core import VectorStoreIndex, Settings
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from llama_index.embeddings.openai import OpenAIEmbedding
+from qdrant_client import QdrantClient
+
+# Ensure these match your data_loader.py exactly
+from data_loader import sync_master_folder, embed_nodes
 
 load_dotenv()
 
-inngest_client = inngest.Inngest(
-    app_id="rag_app",
-    logger=logging.getLogger("uvicorn"),
-    is_production=False, 
-    serializer=inngest.PydanticSerializer()
-)
+# 1. Initialize FastAPI app
+app = FastAPI(title="RAG Production API")
 
+# 2. Initialize Inngest Client
+inngest_client = inngest.Inngest(app_id="rag_prod_app", is_production=False)
+
+# --- FUNCTION 1: Ingest PDFs ---
 @inngest_client.create_function(
-    fn_id="RAG: Ingest PDF",
-    trigger=inngest.TriggerEvent(event="rag/ingest_pdf"),
-    # REMOVED: Rate limits and throttling for "Master Sync" mode
-    # If you are syncing a whole folder, you want it to run fast!
+    fn_id="ingest_pdf_workflow",
+    trigger=inngest.TriggerEvent(event="rag/ingest_pdf"), 
 )
 async def rag_ingest_pdf(ctx: inngest.Context):
-    async def _load(ctx: inngest.Context) -> RAGChunkAndSrc:
-        pdf_path = ctx.event.data["pdf_path"]
-        source_id = ctx.event.data.get("source_id", pdf_path)
-        
-        # We use your loader to get nodes, then extract the text
-        nodes = load_and_chunk_pdf(pdf_path)
-        just_text_chunks = [node.text for node in nodes]
-        
-        return RAGChunkAndSrc(chunks=just_text_chunks, source_id=source_id)
+    pdf_path = ctx.event.data.get("pdf_path")
+    source_id = ctx.event.data.get("source_id", "unknown")
 
-    async def _upsert(chunks_and_src: RAGChunkAndSrc) -> RAGUpsertResult:
-        chunks = chunks_and_src.chunks
-        source_id = chunks_and_src.source_id
-        
-        # Batch embedding for the whole PDF
-        vecs = embed_texts(chunks)
-        
-        # Create unique IDs based on filename and chunk index
-        ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_id}:{i}")) for i in range(len(chunks))]
-        payloads = [{"source": source_id, "text": chunks[i]} for i in range(len(chunks))]
-        
-        QdrantStorage().upsert(ids, vecs, payloads)
-        return RAGUpsertResult(ingested=len(chunks))
+    if not pdf_path:
+        return {"status": "error", "message": "No pdf_path provided"}
 
-    chunks_and_src = await ctx.step.run("load-and-chunk", lambda: _load(ctx), output_type=RAGChunkAndSrc)
-    ingested = await ctx.step.run("embed-and-upsert", lambda: _upsert(chunks_and_src), output_type=RAGUpsertResult)
-    return ingested.model_dump()
+    def run_ingestion():
+        nodes = sync_master_folder(pdf_path)
+        if not nodes:
+            return 0
+        embed_nodes(nodes, source_id=source_id)
+        return len(nodes)
 
+    try:
+        count = await ctx.step.run("ingest_to_qdrant", run_ingestion)
+        return {"status": "success", "source": source_id, "node_count": count}
+    except Exception as e:
+        print(f"Pipeline Error: {str(e)}")
+        raise e
 
+# --- FUNCTION 2: Handle Queries ---
 @inngest_client.create_function(
-    fn_id="RAG: Query PDF",
-    trigger=inngest.TriggerEvent(event="rag/query_pdf_ai")
+    fn_id="query_pdf_workflow",
+    trigger=inngest.TriggerEvent(event="rag/query_pdf_ai"), 
 )
-async def rag_query_pdf_ai(ctx: inngest.Context):
-    async def _search(question: str, top_k: int = 5) -> RAGSearchResult:
-        query_vec = embed_texts([question])[0]
-        store = QdrantStorage()
-        # This now searches across ALL master records in Qdrant
-        found = store.search(query_vec, top_k)
-        return RAGSearchResult(contexts=found.contexts, sources=found.sources)
-
-    question = ctx.event.data["question"]
-    top_k = int(ctx.event.data.get("top_k", 5))
-
-    found = await ctx.step.run("embed-and-search", lambda: _search(question, top_k), output_type=RAGSearchResult)
-
-    # Building the Context for GPT-4o-mini
-    context_block = "\n\n".join(f"- {c}" for c in found.contexts)
-    user_content = (
-        "Use the following context to answer the question. "
-        "If the answer isn't in the context, say you don't know.\n\n"
-        f"Context:\n{context_block}\n\n"
-        f"Question: {question}"
-    )
-
-    adapter = ai.openai.Adapter(
-        auth_key=os.getenv("OPENAI_API_KEY"),
-        model="gpt-4o-mini"
-    )
-
-    res = await ctx.step.ai.infer(
-        "llm-answer",
-        adapter=adapter,
-        body={
-            "max_tokens": 1024,
-            "temperature": 0.1, # Lower temperature for more factual answers
-            "messages": [
-                {"role": "system", "content": "You are a professional corporate chatbot. Answer based strictly on the provided PDF context."},
-                {"role": "user", "content": user_content}
-            ]
+async def handle_query(ctx: inngest.Context):
+    question = ctx.event.data.get("question")
+    
+    def perform_search():
+        # Force the embed model to match the 3072 dimensions in Qdrant
+        Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-large")
+        
+        # Connect to your local Qdrant
+        client = QdrantClient(host="localhost", port=6333)
+        vector_store = QdrantVectorStore(client=client, collection_name="rag_docs")
+        
+        # Query logic
+        index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
+        query_engine = index.as_query_engine(similarity_top_k=5)
+        response = query_engine.query(question)
+        
+        # Extract metadata
+        sources = list(set([n.metadata.get("source_id", "Unknown") for n in response.source_nodes]))
+        
+        return {
+            "answer": str(response),
+            "sources": sources
         }
-    )
 
-    answer = res["choices"][0]["message"]["content"].strip()
-    return {"answer": answer, "sources": list(set(found.sources)), "num_contexts": len(found.contexts)}
+    return await ctx.step.run("search_qdrant", perform_search)
 
-app = FastAPI()
+# 4. Mount BOTH functions to FastAPI
+inngest.fast_api.serve(
+    app,
+    inngest_client,
+    [rag_ingest_pdf, handle_query],
+)
 
-inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai])
+# 5. Run with Uvicorn
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

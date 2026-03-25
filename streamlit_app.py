@@ -8,12 +8,13 @@ from pathlib import Path
 
 load_dotenv()
 
-# UI Setup: Simplified for a clean chatbot look
+# UI Setup
 st.set_page_config(page_title="Master Knowledge Bot", page_icon="🤖", layout="centered")
 
 @st.cache_resource
 def get_inngest_client() -> inngest.Inngest:
-    return inngest.Inngest(app_id="rag_app", is_production=False)
+    # FIXED: Changed from 'rag_app' to 'rag_prod_app' to match backend
+    return inngest.Inngest(app_id="rag_prod_app", is_production=False)
 
 def _inngest_api_base() -> str:
     return os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1")
@@ -23,7 +24,6 @@ def fetch_runs(event_id: str) -> list[dict]:
     try:
         resp = requests.get(url)
         resp.raise_for_status()
-        # Note: Some versions of Inngest Dev Server return 'data' as a list
         return resp.json().get("data", [])
     except Exception:
         return []
@@ -39,7 +39,7 @@ def wait_for_run_output(event_id: str, timeout_s: float = 60.0):
         run = runs[0]
         status = run.get("status")
         
-        # Inngest Dev Server usually uses "Completed" or "Succeeded"
+        # Inngest Dev Server status check
         if status in ("Completed", "Succeeded"):
             return run.get("output") or {}
         if status in ("Failed", "Cancelled"):
@@ -47,13 +47,13 @@ def wait_for_run_output(event_id: str, timeout_s: float = 60.0):
             raise RuntimeError(f"Inngest Function failed: {status} - {error_msg}")
             
         time.sleep(1)
-    raise TimeoutError("Timeout: Is your FastAPI server (Tab 2) and Inngest Dev (Tab 3) running?")
+    raise TimeoutError("Timeout: Is your FastAPI server (Tab 1) and Inngest Dev (Tab 2) running?")
 
 # --- MAIN UI ---
 st.title("🤖 Master Knowledge Chatbot")
 st.markdown("Ask anything about the company's master PDF records.")
 
-# Initialize chat history for a true "Chatbot" feel
+# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -64,7 +64,7 @@ for message in st.session_state.messages:
 
 # Chat Input
 if prompt := st.chat_input("What would you like to know?"):
-    # Add user message to chat history
+    # Add user message to history
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -72,26 +72,26 @@ if prompt := st.chat_input("What would you like to know?"):
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                # Trigger the Inngest query event
                 client = get_inngest_client()
+                # Sending event to 'rag_prod_app'
                 ids = client.send_sync(
                     inngest.Event(
                         name="rag/query_pdf_ai",
                         data={
                             "question": prompt,
-                            "top_k": 5, # You can hardcode this or make it a sidebar setting
+                            "top_k": 5, 
                         },
                     )
                 )
                 
-                # Wait for the background result
+                # Wait for the background result from Qdrant/OpenAI
                 output = wait_for_run_output(ids[0])
                 answer = output.get("answer", "I couldn't find an answer in the records.")
                 
                 # Display Answer
                 st.markdown(answer)
                 
-                # Show Sources if available
+                # Show Sources
                 if output.get("sources"):
                     with st.expander("View Sources"):
                         st.caption(f"Sources: {', '.join(output['sources'])}")

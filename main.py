@@ -1,67 +1,91 @@
-# 📂 RAG Production Intelligence System
+import os
+from fastapi import FastAPI
+import inngest
+import inngest.fast_api
+from dotenv import load_dotenv
 
-A high-performance, asynchronous **Retrieval-Augmented Generation (RAG)** pipeline. This system is engineered for scalability, moving beyond simple scripts into a production-ready environment using **FastAPI** for the backend, **Inngest** for reliable event orchestration, and **Qdrant** for high-dimensional vector search.
+# Query specific imports
+from llama_index.core import VectorStoreIndex, Settings
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+from llama_index.embeddings.openai import OpenAIEmbedding
+from qdrant_client import QdrantClient
 
----
+# Ensure these match your data_loader.py exactly
+from data_loader import sync_master_folder, embed_nodes
 
-## 🏗️ Architecture: From Monolith to Distributed
-The application is structured as a **three-tier system** to ensure the user interface remains responsive even during heavy AI processing:
+load_dotenv()
 
-1. **The Interface (`streamlit_app.py`)**: A clean, reactive frontend for document upload and querying.
-2. **The Brain (FastAPI / `main.py`)**: A dedicated backend server that hosts the AI logic and embedding engine.
-3. **The Orchestrator (Inngest)**: A background worker system that manages long-running tasks (like PDF embedding) so the UI never freezes.
+# 1. Initialize FastAPI app
+app = FastAPI(title="RAG Production API")
 
----
+# 2. Initialize Inngest Client
+inngest_client = inngest.Inngest(app_id="rag_prod_app", is_production=False)
 
-## 🛠️ Key Engineering Enhancements
+# --- FUNCTION 1: Ingest PDFs ---
+@inngest_client.create_function(
+    fn_id="ingest_pdf_workflow",
+    trigger=inngest.TriggerEvent(event="rag/ingest_pdf"), 
+)
+async def rag_ingest_pdf(ctx: inngest.Context):
+    pdf_path = ctx.event.data.get("pdf_path")
+    source_id = ctx.event.data.get("source_id", "unknown")
 
-### 1. Unified Vector Alignment
-The system is standardized on **OpenAI’s `text-embedding-3-large`** model. 
-* **The Challenge**: Standard RAG setups often suffer from "Dimension Mismatches" (e.g., searching 3072-dim data with a 1536-dim query).
-* **The Solution**: Forced 3072-dimension consistency across both the **Ingestion** and **Query** layers, ensuring 100% precision in Qdrant retrieval.
+    if not pdf_path:
+        return {"status": "error", "message": "No pdf_path provided"}
 
-### 2. Asynchronous Ingestion Pipeline
-By utilizing **Inngest**, the app handles PDF processing as a resilient background "Job."
-* **Reliability**: If an API call to OpenAI fails, the system automatically handles retries.
-* **Concurrency**: Users can continue querying existing data while new documents are being indexed in the background.
+    def run_ingestion():
+        nodes = sync_master_folder(pdf_path)
+        if not nodes:
+            return 0
+        embed_nodes(nodes, source_id=source_id)
+        return len(nodes)
 
----
+    try:
+        count = await ctx.step.run("ingest_to_qdrant", run_ingestion)
+        return {"status": "success", "source": source_id, "node_count": count}
+    except Exception as e:
+        print(f"Pipeline Error: {str(e)}")
+        raise e
 
-## 🚀 Execution Instructions
+# --- FUNCTION 2: Handle Queries ---
+@inngest_client.create_function(
+    fn_id="query_pdf_workflow",
+    trigger=inngest.TriggerEvent(event="rag/query_pdf_ai"), 
+)
+async def handle_query(ctx: inngest.Context):
+    question = ctx.event.data.get("question")
+    
+    def perform_search():
+        # Force the embed model to match the 3072 dimensions in Qdrant
+        Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-large")
+        
+        # Connect to your local Qdrant
+        client = QdrantClient(host="localhost", port=6333)
+        vector_store = QdrantVectorStore(client=client, collection_name="rag_docs")
+        
+        # Query logic
+        index = VectorStoreIndex.from_vector_store(vector_store=vector_store)
+        query_engine = index.as_query_engine(similarity_top_k=5)
+        response = query_engine.query(question)
+        
+        # Extract metadata
+        sources = list(set([n.metadata.get("source_id", "Unknown") for n in response.source_nodes]))
+        
+        return {
+            "answer": str(response),
+            "sources": sources
+        }
 
-To run the full stack, open **three separate terminal tabs** and run one command in each:
+    return await ctx.step.run("search_qdrant", perform_search)
 
-### Terminal 1: Start the Backend (The "Engine")
-This starts the FastAPI server on port 8000.
-```bash
-/Users/nagarajukrishnappa/Desktop/RAGProdApp/.venv/bin/python main.py
-```
+# 4. Mount BOTH functions to FastAPI
+inngest.fast_api.serve(
+    app,
+    inngest_client,
+    [rag_ingest_pdf, handle_query],
+)
 
-### Terminal 2: Start the Bridge (Inngest)
-This connects the UI to the background workers via the Inngest Dev Server.
-```bash
-npx inngest-cli@latest dev -u [http://127.0.0.1:8000/api/inngest](http://127.0.0.1:8000/api/inngest)
-```
-
-### Terminal 3: Start the UI (The "Dashboard")
-Launch the user-facing Streamlit application.
-```bash
-/Users/nagarajukrishnappa/Desktop/RAGProdApp/.venv/bin/python -m streamlit run streamlit_app.py
-```
-
----
-
-## 📂 Project Structure
-
-* **`main.py`**: The central API and Background Worker host. (App ID: `rag_prod_app`)
-* **`data_loader.py`**: Logic for document chunking and vector upserts.
-* **`streamlit_app.py`**: The Streamlit user interface.
-* **`Qdrant`**: Vector database running on `localhost:6333`.
-
----
-
-## 📈 Roadmap
-
-- [ ] **Advanced Reranking**: Implementing a Cross-Encoder layer to prioritize the most relevant document chunks.
-- [ ] **Multi-modal Support**: Extraction and querying of charts and images within technical PDFs.
-- [ ] **Auto-scaling**: Transitioning background workers to serverless cloud functions.
+# 5. Run with Uvicorn
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

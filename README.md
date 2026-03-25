@@ -7,7 +7,7 @@ A high-performance, asynchronous **Retrieval-Augmented Generation (RAG)** pipeli
 ## 🏗️ Architecture: From Monolith to Distributed
 The application is structured as a **three-tier system** to ensure the user interface remains responsive even during heavy AI processing:
 
-1. **The Interface (Streamlit)**: A clean, reactive frontend for document upload and querying.
+1. **The Interface (`streamlit_app.py`)**: A clean, reactive frontend for document upload and querying.
 2. **The Brain (FastAPI / `main.py`)**: A dedicated backend server that hosts the AI logic and embedding engine.
 3. **The Orchestrator (Inngest)**: A background worker system that manages long-running tasks (like PDF embedding) so the UI never freezes.
 
@@ -25,26 +25,26 @@ By utilizing **Inngest**, the app handles PDF processing as a resilient backgrou
 * **Reliability**: If an API call to OpenAI fails, the system automatically handles retries.
 * **Concurrency**: Users can continue querying existing data while new documents are being indexed in the background.
 
-### 3. Isolated Environment Management
-The project utilizes a dedicated Python 3.13 virtual environment (`.venv`) with specifically injected LlamaIndex modules (`embeddings-openai`, `llms-openai`) to ensure zero dependency drift and maximum performance.
-
 ---
 
 ## 🚀 Execution Instructions
 
-To run the full stack, you must have three services running. Open **three separate terminal tabs** and run one command in each:
+To run the full stack, open **three separate terminal tabs** and run one command in each:
 
 ### Terminal 1: Start the Backend (The "Engine")
+This starts the FastAPI server on port 8000.
 ```bash
 /Users/nagarajukrishnappa/Desktop/RAGProdApp/.venv/bin/python main.py
 ```
 
 ### Terminal 2: Start the Bridge (Inngest)
+This connects the UI to the background workers via the Inngest Dev Server.
 ```bash
-npx inngest-cli@latest dev -u http://127.0.0.1:8000/api/inngest
+npx inngest-cli@latest dev -u [http://127.0.0.1:8000/api/inngest](http://127.0.0.1:8000/api/inngest)
 ```
 
 ### Terminal 3: Start the UI (The "Dashboard")
+Launch the user-facing Streamlit application.
 ```bash
 /Users/nagarajukrishnappa/Desktop/RAGProdApp/.venv/bin/python -m streamlit run streamlit_app.py
 ```
@@ -53,10 +53,10 @@ npx inngest-cli@latest dev -u http://127.0.0.1:8000/api/inngest
 
 ## 📂 Project Structure
 
-* **`main.py`**: The central API and Background Worker host.
+* **`main.py`**: The central API and Background Worker host. (App ID: `rag_prod_app`)
 * **`data_loader.py`**: Logic for document chunking and vector upserts.
 * **`streamlit_app.py`**: The Streamlit user interface.
-* **`Qdrant`**: Vector database for persistent, high-speed memory.
+* **`Qdrant`**: Vector database running on `localhost:6333`.
 
 ---
 
